@@ -1,7 +1,5 @@
 package pkg
 
-import "log"
-
 // WorkerPool is a contract for Worker Pool implementation
 type WorkerPool interface {
 	Run()
@@ -25,7 +23,7 @@ func NewWorkerPool(maxWorker int) WorkerPool {
 
 func (wp *workerPool) Run() {
 	for i := 1; i <= wp.maxWorker; i++ {
-		log.Printf("[WorkerPool] Worker %d has been spawned", i)
+		// log.Printf("[WorkerPool] Worker %d has been spawned", i)
 		go func(workerID int) {
 			for task := range wp.queuedTaskC {
 				// log.Printf("[WorkerPool] Worker %d start processing task", workerID)

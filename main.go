@@ -12,9 +12,9 @@ import (
 	"github.com/polapolo/timescaledbbenchmark/pkg"
 )
 
-const numOfUserIDs = 10 // number of users
-const numOfOrders = 10  // order matched per user
-const numOfTrades = 1   // trade matched per order
+const numOfUserIDs = 100000 // number of users
+const numOfOrders = 10      // order matched per user
+const numOfTrades = 1       // trade matched per order
 
 const numOfWorkers = 4
 
@@ -32,10 +32,13 @@ func main() {
 
 	startTime := time.Now()
 	concurrentInsertOrders(ctx, db)
-	concurrentInsertTrades(ctx, db)
-	endTime := time.Since(startTime)
+	timeElapsed := time.Since(startTime)
+	log.Println("Total Time Order Speed:", timeElapsed.Milliseconds(), "ms")
 
-	log.Println("Total Time:", endTime.Milliseconds(), "ms")
+	startTime = time.Now()
+	concurrentInsertTrades(ctx, db)
+	timeElapsed = time.Since(startTime)
+	log.Println("Total Time Trade Speed:", timeElapsed.Milliseconds(), "ms")
 }
 
 func connectDB(ctx context.Context) *pgxpool.Pool {
@@ -149,6 +152,11 @@ func generateInsertTradeQueries() []string {
 	return queries
 }
 
+type result struct {
+	WorkerID  int
+	SpeedInMs int64
+}
+
 func concurrentInsertOrders(ctx context.Context, db *pgxpool.Pool) {
 	orderQueries := generateInsertOrderQueries()
 
@@ -156,27 +164,42 @@ func concurrentInsertOrders(ctx context.Context, db *pgxpool.Pool) {
 	insertWorkerPool.Run()
 
 	totalTask := len(orderQueries)
-	resultC := make(chan int, totalTask)
+	resultC := make(chan result, totalTask)
 
 	for i := 0; i < totalTask; i++ {
 		query := orderQueries[i]
 		id := i
 		insertWorkerPool.AddTask(func() {
-			log.Printf("[main] Starting task %d", id)
+			// log.Printf("[main] Starting task %d", id)
+
+			startTime := time.Now()
 
 			_, err := db.Exec(ctx, query)
 			if err != nil {
 				log.Fatalln(query, err)
 			}
 
-			resultC <- id
+			timeElapsed := time.Since(startTime)
+
+			resultC <- result{
+				WorkerID:  id,
+				SpeedInMs: timeElapsed.Microseconds(),
+			}
 		})
 	}
 
+	var totalSpeedInMs int64
 	for i := 0; i < totalTask; i++ {
 		result := <-resultC
-		log.Printf("[FNISH] Task %d", result)
+		totalSpeedInMs += result.SpeedInMs
+		// log.Printf("[FNISH] Task %d", result)
 	}
+
+	avgSpeedInMs := float64(float64(totalSpeedInMs) / float64(totalTask))
+	totalRecord := numOfUserIDs * numOfOrders * numOfTrades
+	avgSpeedInSecond := float64(float64(avgSpeedInMs) / float64(1000000))
+	recordPerSecond := float64(1) / float64(avgSpeedInSecond) * float64(totalRecord)
+	log.Println("Concurrent Insert Order Speed:", avgSpeedInMs, "microsecond | ", int64(recordPerSecond), "records/s")
 }
 
 func concurrentInsertTrades(ctx context.Context, db *pgxpool.Pool) {
@@ -186,25 +209,40 @@ func concurrentInsertTrades(ctx context.Context, db *pgxpool.Pool) {
 	insertWorkerPool.Run()
 
 	totalTask := len(tradeQueries)
-	resultC := make(chan int, totalTask)
+	resultC := make(chan result, totalTask)
 
 	for i := 0; i < totalTask; i++ {
 		query := tradeQueries[i]
 		id := i
 		insertWorkerPool.AddTask(func() {
-			log.Printf("[main] Starting task %d", id)
+			// log.Printf("[main] Starting task %d", id)
+
+			startTime := time.Now()
 
 			_, err := db.Exec(ctx, query)
 			if err != nil {
 				log.Fatalln(query, err)
 			}
 
-			resultC <- id
+			timeElapsed := time.Since(startTime)
+
+			resultC <- result{
+				WorkerID:  id,
+				SpeedInMs: timeElapsed.Microseconds(),
+			}
 		})
 	}
 
+	var totalSpeedInMs int64
 	for i := 0; i < totalTask; i++ {
 		result := <-resultC
-		log.Printf("[FNISH] Task %d", result)
+		totalSpeedInMs += result.SpeedInMs
+		// log.Printf("[FNISH] Task %d", result)
 	}
+
+	avgSpeedInMs := float64(float64(totalSpeedInMs) / float64(totalTask))
+	totalRecord := numOfUserIDs * numOfOrders * numOfTrades
+	avgSpeedInSecond := float64(float64(avgSpeedInMs) / float64(1000000))
+	recordPerSecond := float64(1) / float64(avgSpeedInSecond) * float64(totalRecord)
+	log.Println("Concurrent Insert Trade Speed:", avgSpeedInMs, "microsecond | ", int64(recordPerSecond), "records/s")
 }
