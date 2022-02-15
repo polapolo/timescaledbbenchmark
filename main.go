@@ -10,16 +10,18 @@ import (
 
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/lib/pq"
 
 	"github.com/polapolo/timescaledbbenchmark/pkg"
 )
 
-const numOfUserIDs = 10 // number of users
-const numOfOrders = 10  // order matched per user
-const numOfTrades = 1   // trade matched per order
+const numOfUserIDs = 100000 // number of users
+const numOfOrders = 10      // order matched per user
+const numOfTrades = 1       // trade matched per order
 
 const numOfWorkers = 4
 
+// https://www.timescale.com/blog/13-tips-to-improve-postgresql-insert-performance/
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
@@ -29,7 +31,6 @@ func main() {
 	db := connectDB(ctx)
 	defer db.Close()
 
-	// refresh table
 	refreshSchema(ctx, db)
 
 	batchInsertOrder(ctx, db)
@@ -37,6 +38,8 @@ func main() {
 	batchInsertInitialCash(ctx, db)
 
 	// batchUpdateOrder(ctx, db)
+
+	concurrentlyGetEndBalance(ctx, db)
 }
 
 func connectDB(ctx context.Context) *pgxpool.Pool {
@@ -51,7 +54,12 @@ func connectDB(ctx context.Context) *pgxpool.Pool {
 }
 
 func refreshSchema(ctx context.Context, db *pgxpool.Pool) {
-	_, err := db.Exec(ctx, `DROP TABLE IF EXISTS trades`)
+	_, err := db.Exec(ctx, `DROP MATERIALIZED VIEW IF EXISTS trades_daily`)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	_, err = db.Exec(ctx, `DROP TABLE IF EXISTS trades`)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -82,7 +90,9 @@ func refreshSchema(ctx context.Context, db *pgxpool.Pool) {
 	_, err = db.Exec(ctx, `CREATE TABLE IF NOT EXISTS trades (
 		order_id bigint,
 		lot bigint,
+		lot_multiplier int,
 		price int,
+		total bigint,
 		created_at TIMESTAMPTZ,
 		FOREIGN KEY (order_id) REFERENCES orders (id)
 	)`)
@@ -91,6 +101,20 @@ func refreshSchema(ctx context.Context, db *pgxpool.Pool) {
 	}
 
 	_, err = db.Exec(ctx, `SELECT create_hypertable('trades', 'created_at')`)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	_, err = db.Exec(ctx, `CREATE MATERIALIZED VIEW trades_daily
+	WITH (timescaledb.continuous,timescaledb.create_group_indexes)
+	AS
+		SELECT
+		   time_bucket('1 day', created_at) as bucket,
+		   order_id,
+		   sum(total) as sum_total
+		FROM trades
+		GROUP BY bucket, order_id
+		WITH DATA;`)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -158,7 +182,7 @@ func generateInsertTradeQueries() []string {
 
 			// trades
 			for k := 1; k <= numOfTrades; k++ {
-				queries = append(queries, `INSERT INTO trades(order_id, lot, price, created_at) VALUES (`+strconv.Itoa(j+offset)+`,10,1000,'`+time.Now().Format(time.RFC3339)+`');`)
+				queries = append(queries, `INSERT INTO trades(order_id, lot, lot_multiplier, price, total, created_at) VALUES (`+strconv.Itoa(j+offset)+`,10,100,1000,1000000,'`+time.Now().Format(time.RFC3339)+`');`)
 			}
 		}
 	}
@@ -170,7 +194,7 @@ func generateInsertInitialCashQueries() []string {
 	queries := make([]string, 0)
 	// users
 	for i := 1; i <= numOfUserIDs; i++ {
-		queries = append(queries, `INSERT INTO initial_cash(user_id, cash_on_hand) VALUES (`+strconv.Itoa(i)+`,1000);`)
+		queries = append(queries, `INSERT INTO initial_cash(user_id, cash_on_hand) VALUES (`+strconv.Itoa(i)+`,1000000);`)
 	}
 
 	return queries
@@ -491,4 +515,144 @@ func chunkSlice(slice []string, chunkSize int) [][]string {
 	}
 
 	return chunkedSlice
+}
+
+func getInitialCashByUserID(ctx context.Context, db *pgxpool.Pool, userID int64) (int64, error) {
+	var cashOnHand int64
+	err := db.QueryRow(ctx, `SELECT cash_on_hand FROM initial_cash WHERE user_id = $1`, userID).Scan(&cashOnHand)
+	if err != nil {
+		log.Println("getInitialCashByUserID", err)
+		return 0, err
+	}
+
+	return cashOnHand, nil
+}
+
+// status
+// 1: matched
+// 2: partially matched
+func getOrderBuyByUserID(ctx context.Context, db *pgxpool.Pool, userID int64) ([]int64, error) {
+	rows, err := db.Query(ctx, `SELECT id FROM orders WHERE user_id = $1 AND type = $2 AND status IN (1,2)`, userID, "B")
+	if err != nil {
+		log.Println("getOrderBuyByUserID", err)
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	var orderIDs []int64
+	for rows.Next() {
+		var orderID int64
+		err = rows.Scan(&orderID)
+		if err != nil {
+			log.Println("getOrderBuyByUserID", err)
+			return nil, err
+		}
+
+		orderIDs = append(orderIDs, orderID)
+	}
+
+	return orderIDs, nil
+}
+
+// status
+// 1: matched
+// 2: partially matched
+func getOrderSellByUserID(ctx context.Context, db *pgxpool.Pool, userID int64) ([]int64, error) {
+	rows, err := db.Query(ctx, `SELECT id FROM orders WHERE user_id = $1 AND type = $2 AND status IN (1,2)`, userID, "S")
+	if err != nil {
+		log.Println("getOrderSellByUserID", err)
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	var orderIDs []int64
+	for rows.Next() {
+		var orderID int64
+		err = rows.Scan(&orderID)
+		if err != nil {
+			log.Println("getOrderSellByUserID", err)
+			return nil, err
+		}
+
+		orderIDs = append(orderIDs, orderID)
+	}
+
+	return orderIDs, nil
+}
+
+func getTradeDailyTotalByOrderIDs(ctx context.Context, db *pgxpool.Pool, orderIDs []int64) (int64, error) {
+	var total int64
+	err := db.QueryRow(ctx, `SELECT SUM(sum_total) FROM trades_daily WHERE order_id = ANY($1) AND DATE(bucket) = CURRENT_DATE`, pq.Array(orderIDs)).Scan(&total)
+	if err != nil {
+		log.Println("getTradeDailyTotalByOrderIDs", err)
+		return 0, err
+	}
+
+	return total, nil
+}
+
+func getEndBalance(ctx context.Context, db *pgxpool.Pool, userID int64) (int64, error) {
+	initialCash, err := getInitialCashByUserID(ctx, db, userID)
+	if err != nil {
+		log.Println("getEndBalance", "getInitialCashByUserID", err)
+		return 0, nil
+	}
+
+	buyOrderIDs, err := getOrderBuyByUserID(ctx, db, userID)
+	if err != nil {
+		log.Println("getEndBalance", "getOrderBuyByUserID", err)
+		return 0, nil
+	}
+	sellOrderIDs, err := getOrderSellByUserID(ctx, db, userID)
+	if err != nil {
+		log.Println("getEndBalance", "getOrderSellByUserID", err)
+		return 0, nil
+	}
+
+	buyTotal, err := getTradeDailyTotalByOrderIDs(ctx, db, buyOrderIDs)
+	if err != nil {
+		log.Println("getEndBalance", "getTradeDailyTotalByOrderIDs", err)
+		return 0, nil
+	}
+	sellTotal, err := getTradeDailyTotalByOrderIDs(ctx, db, sellOrderIDs)
+	if err != nil {
+		log.Println("getEndBalance", "getTradeDailyTotalByOrderIDs", err)
+		return 0, nil
+	}
+
+	endBalance := initialCash + buyTotal - sellTotal
+
+	return endBalance, nil
+}
+
+// concurrentlyGetEndBalance concurrently get all 100k users end balance and wait for it to finish.
+func concurrentlyGetEndBalance(ctx context.Context, db *pgxpool.Pool) {
+	startTime := time.Now()
+
+	getEndBalanceChannel := make(chan int64, numOfUserIDs)
+
+	for i := int64(1); i <= numOfUserIDs; i++ {
+		userID := i
+		go func() {
+			endBalance, err := getEndBalance(ctx, db, userID)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+
+			// log.Println(userID, endBalance)
+
+			getEndBalanceChannel <- endBalance
+		}()
+	}
+
+	for i := int64(1); i <= numOfUserIDs; i++ {
+		_ = <-getEndBalanceChannel
+		// log.Println(a)
+	}
+
+	timeElapsed := time.Since(startTime)
+	log.Println("Elapsed Time:", timeElapsed.Milliseconds(), "ms")
 }
