@@ -14,9 +14,9 @@ import (
 	"github.com/polapolo/timescaledbbenchmark/pkg"
 )
 
-const numOfUserIDs = 100000 // number of users
-const numOfOrders = 10      // order matched per user
-const numOfTrades = 1       // trade matched per order
+const numOfUserIDs = 10 // number of users
+const numOfOrders = 10  // order matched per user
+const numOfTrades = 1   // trade matched per order
 
 const numOfWorkers = 4
 
@@ -33,6 +33,8 @@ func main() {
 	refreshSchema(ctx, db)
 
 	batchInsertOrder(ctx, db)
+	batchInsertTrade(ctx, db)
+	batchInsertInitialCash(ctx, db)
 
 	// batchUpdateOrder(ctx, db)
 }
@@ -159,6 +161,16 @@ func generateInsertTradeQueries() []string {
 				queries = append(queries, `INSERT INTO trades(order_id, lot, price, created_at) VALUES (`+strconv.Itoa(j+offset)+`,10,1000,'`+time.Now().Format(time.RFC3339)+`');`)
 			}
 		}
+	}
+
+	return queries
+}
+
+func generateInsertInitialCashQueries() []string {
+	queries := make([]string, 0)
+	// users
+	for i := 1; i <= numOfUserIDs; i++ {
+		queries = append(queries, `INSERT INTO initial_cash(user_id, cash_on_hand) VALUES (`+strconv.Itoa(i)+`,1000);`)
 	}
 
 	return queries
@@ -356,6 +368,82 @@ func batchInsertOrder(ctx context.Context, db *pgxpool.Pool) {
 
 	timeElapsed := time.Since(startTime)
 	log.Println("Total Time Batch Insert Order Speed:", timeElapsed.Milliseconds(), "ms")
+}
+
+func batchInsertTrade(ctx context.Context, db *pgxpool.Pool) {
+	startTime := time.Now()
+
+	queries := generateInsertTradeQueries()
+
+	// queriesChunks := chunkSlice(queries, 5000)
+
+	// for _, queriesChunk := range queriesChunks {
+	batch := &pgx.Batch{}
+	// load insert statements into batch queue
+	for i := range queries {
+		batch.Queue(queries[i])
+	}
+	batch.Queue("select count(*) from trades")
+
+	// send batch to connection pool
+	br := db.SendBatch(ctx, batch)
+	defer br.Close()
+	// execute statements in batch queue
+	_, err := br.Exec()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Unable to execute statement in batch queue %v\n", err)
+		os.Exit(1)
+	}
+
+	// //Compare length of results slice to size of table
+	// fmt.Printf("size of results: %d\n", len(queries))
+	// //check size of table for number of rows inserted
+	// // result of last SELECT statement
+	// var rowsInserted int
+	// br.QueryRow().Scan(&rowsInserted)
+	// fmt.Printf("size of table: %d\n", rowsInserted)
+	// }
+
+	timeElapsed := time.Since(startTime)
+	log.Println("Total Time Batch Insert Trade Speed:", timeElapsed.Milliseconds(), "ms")
+}
+
+func batchInsertInitialCash(ctx context.Context, db *pgxpool.Pool) {
+	startTime := time.Now()
+
+	queries := generateInsertInitialCashQueries()
+
+	// queriesChunks := chunkSlice(queries, 5000)
+
+	// for _, queriesChunk := range queriesChunks {
+	batch := &pgx.Batch{}
+	// load insert statements into batch queue
+	for i := range queries {
+		batch.Queue(queries[i])
+	}
+	batch.Queue("select count(*) from initial_cash")
+
+	// send batch to connection pool
+	br := db.SendBatch(ctx, batch)
+	defer br.Close()
+	// execute statements in batch queue
+	_, err := br.Exec()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Unable to execute statement in batch queue %v\n", err)
+		os.Exit(1)
+	}
+
+	// //Compare length of results slice to size of table
+	// fmt.Printf("size of results: %d\n", len(queries))
+	// //check size of table for number of rows inserted
+	// // result of last SELECT statement
+	// var rowsInserted int
+	// br.QueryRow().Scan(&rowsInserted)
+	// fmt.Printf("size of table: %d\n", rowsInserted)
+	// }
+
+	timeElapsed := time.Since(startTime)
+	log.Println("Total Time Batch Insert Initial Cash Speed:", timeElapsed.Milliseconds(), "ms")
 }
 
 // https://github.com/jackc/pgx/issues/374
