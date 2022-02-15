@@ -4,56 +4,75 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math/rand"
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/polapolo/timescaledbbenchmark/pkg"
 )
 
-const numOfWorkers = 4
+const numOfUserIDs = 100000 // scale
+const numOfOrders = 10      // matched per user
+const numOfTrades = 1       // matched per order
 
-const numOfUserIDs = 1          // scale
-const numOfInsertQueries = 1000 // queries
-
-var stockCodes = []string{
-	"BBCA",
-	"BBRI",
-	"BBNI",
-	"BBYB",
-	"BBHI",
-	"AMAR",
-	"ARTO",
-}
-
-var orderType = []string{
-	"B",
-	"S",
-}
-
-var price = []int{
-	1000,
-	2000,
-}
+const numOfInsertWorkers = 4
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
 	ctx := context.Background()
 
+	// connect db
 	db := connectDB(ctx)
 	defer db.Close()
 
-	queries := generateInsertQueries()
+	// refresh table
+	refreshSchema(ctx, db)
 
-	wg := sync.WaitGroup{}
-	for i := 0; i < len(queries); i++ {
-		wg.Add(1)
-		go insert(ctx, wg, db, queries[i])
+	orderQueries := generateInsertOrderQueries()
+
+	insertWorkerPool := pkg.NewWorkerPool(numOfInsertWorkers)
+	insertWorkerPool.Run()
+
+	totalTask := len(orderQueries)
+	resultC := make(chan bool, totalTask)
+
+	for i := 0; i < totalTask; i++ {
+		query := orderQueries[i]
+		id := i
+		insertWorkerPool.AddTask(func() {
+			log.Printf("[main] Starting task %d", id)
+			insertWithChannel(ctx, db, query, i)
+			resultC <- true
+		})
 	}
-	wg.Wait()
 
-	log.Fatalf("%+v", queries)
-	// refreshSchema(ctx, db)
+	for i := 0; i < totalTask; i++ {
+		result := <-resultC
+		log.Println("[FNISH] Task", result)
+	}
+
+	// wg := sync.WaitGroup{}
+
+	// // insert order concurrently
+	// orderQueries := generateInsertOrderQueries()
+	// wg.Add(numOfInsertWorkers)
+	// for i := 0; i < numOfInsertWorkers; i++ {
+	// 	go insert(ctx, wg, db, orderQueries[i], i)
+	// }
+	// wg.Wait()
+
+	// // insert trade concurrently
+	// tradeQueries := generateInsertTradeQueries()
+	// wg.Add(len(tradeQueries))
+	// for i := 0; i < len(tradeQueries); i++ {
+	// 	go insert(ctx, wg, db, tradeQueries[i], i)
+	// }
+	// wg.Wait()
+
+	log.Println("DONE")
 }
 
 func connectDB(ctx context.Context) *pgxpool.Pool {
@@ -68,7 +87,12 @@ func connectDB(ctx context.Context) *pgxpool.Pool {
 }
 
 func refreshSchema(ctx context.Context, db *pgxpool.Pool) {
-	_, err := db.Exec(ctx, `DROP TABLE IF EXISTS orders`)
+	_, err := db.Exec(ctx, `DROP TABLE IF EXISTS trades`)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	_, err = db.Exec(ctx, `DROP TABLE IF EXISTS orders`)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -80,14 +104,29 @@ func refreshSchema(ctx context.Context, db *pgxpool.Pool) {
 		type VARCHAR(1),
 		lot bigint,
 		price int,
-		status int,
-		created_at TIMESTAMPTZ
+		status int
 	)`)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	_, err = db.Exec(ctx, `SELECT create_hypertable('orders', 'timestamp')`)
+	// _, err = db.Exec(ctx, `SELECT create_hypertable('orders', 'timestamp')`)
+	// if err != nil {
+	// 	log.Fatalln(err)
+	// }
+
+	_, err = db.Exec(ctx, `CREATE TABLE IF NOT EXISTS trades (
+		order_id bigint,
+		lot bigint,
+		price int,
+		created_at TIMESTAMPTZ,
+		FOREIGN KEY (order_id) REFERENCES orders (id)
+	)`)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	_, err = db.Exec(ctx, `SELECT create_hypertable('trades', 'created_at')`)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -100,42 +139,71 @@ func refreshSchema(ctx context.Context, db *pgxpool.Pool) {
 	_, err = db.Exec(ctx, `CREATE TABLE IF NOT EXISTS initial_cash (
 		id BIGSERIAL PRIMARY KEY,
 		user_id bigint,
-		stock_code varchar(6),
-		type VARCHAR(1),
-		lot bigint,
-		price int,
-		status int
+		cash_on_hand bigint
 	)`)
 	if err != nil {
 		log.Fatalln(err)
 	}
 }
 
-func generateInsertQueries() []string {
-	queries := make([]string, numOfUserIDs*numOfInsertQueries)
-	queryIndex := 0
+func generateInsertOrderQueries() []string {
+	queries := make([]string, 0)
+	// users
 	for i := 1; i <= numOfUserIDs; i++ {
-		for j := 0; j < numOfInsertQueries; j++ {
+		// orders
+		for j := 1; j <= numOfOrders; j++ {
 			orderType := "B"
-			if j%2 == 1 {
+			if j%2 == 0 {
 				orderType = "S"
 			}
-			queries[queryIndex] = `
-			INSERT INTO orders(user_id, stock_code, type, lot, price, status) VALUES (` + strconv.Itoa(i) + `,"` + "BBCA" + `","` + orderType + `",` + strconv.Itoa(10) + `,` + strconv.Itoa(price[rand.Intn(2)]) + `,1);`
-			queryIndex++
+
+			offset := numOfOrders * (i - 1)
+
+			query := `INSERT INTO orders(id, user_id, stock_code, type, lot, price, status) VALUES (` + strconv.Itoa(j+offset) + `,` + strconv.Itoa(i) + `,'BBCA','` + orderType + `',10,1000,1);`
+			// log.Println(query)
+			queries = append(queries, query)
 		}
 	}
 
 	return queries
 }
 
-func insert(ctx context.Context, wg sync.WaitGroup, db *pgxpool.Pool, query string) {
+func generateInsertTradeQueries() []string {
+	queries := make([]string, 0)
+	// users
+	for i := 1; i <= numOfUserIDs; i++ {
+		// orders
+		for j := 1; j <= numOfOrders; j++ {
+			offset := numOfOrders * i
+
+			// trades
+			for k := 1; k <= numOfTrades; k++ {
+				queries = append(queries, `INSERT INTO trades(order_id, lot, price, created_at) VALUES (`+strconv.Itoa(j+offset)+`,10,1000,'`+time.Now().Format(time.RFC3339)+`');`)
+			}
+		}
+	}
+
+	return queries
+}
+
+func insert(ctx context.Context, wg sync.WaitGroup, db *pgxpool.Pool, query string, i int) {
 	defer wg.Done()
 
 	_, err := db.Exec(ctx, query)
 	if err != nil {
 		log.Fatalln(query, err)
 	}
+
+	// log.Println(i, query)
+}
+
+func insertWithChannel(ctx context.Context, db *pgxpool.Pool, query string, i int) {
+	_, err := db.Exec(ctx, query)
+	if err != nil {
+		log.Fatalln(query, err)
+	}
+
+	// log.Println(i, query)
 }
 
 // func updateCPUTagID() {
