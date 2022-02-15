@@ -8,7 +8,9 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
+
 	"github.com/polapolo/timescaledbbenchmark/pkg"
 )
 
@@ -30,15 +32,9 @@ func main() {
 	// refresh table
 	refreshSchema(ctx, db)
 
-	startTime := time.Now()
-	concurrentInsertOrders(ctx, db)
-	timeElapsed := time.Since(startTime)
-	log.Println("Total Time Order Speed:", timeElapsed.Milliseconds(), "ms")
+	batchInsertOrder(ctx, db)
 
-	startTime = time.Now()
-	concurrentInsertTrades(ctx, db)
-	timeElapsed = time.Since(startTime)
-	log.Println("Total Time Trade Speed:", timeElapsed.Milliseconds(), "ms")
+	// batchUpdateOrder(ctx, db)
 }
 
 func connectDB(ctx context.Context) *pgxpool.Pool {
@@ -134,6 +130,22 @@ func generateInsertOrderQueries() []string {
 	return queries
 }
 
+func generateUpdateOrderQueries() []string {
+	queries := make([]string, 0)
+	// users
+	for i := 1; i <= numOfUserIDs; i++ {
+		// orders
+		for j := 1; j <= numOfOrders; j++ {
+			offset := numOfOrders * (i - 1)
+
+			query := `UPDATE orders SET status = 2 WHERE id = ` + strconv.Itoa(j+offset)
+			queries = append(queries, query)
+		}
+	}
+
+	return queries
+}
+
 func generateInsertTradeQueries() []string {
 	queries := make([]string, 0)
 	// users
@@ -159,6 +171,8 @@ type result struct {
 
 func concurrentInsertOrders(ctx context.Context, db *pgxpool.Pool) {
 	orderQueries := generateInsertOrderQueries()
+
+	startTime := time.Now()
 
 	insertWorkerPool := pkg.NewWorkerPool(numOfWorkers)
 	insertWorkerPool.Run()
@@ -200,10 +214,65 @@ func concurrentInsertOrders(ctx context.Context, db *pgxpool.Pool) {
 	avgSpeedInSecond := float64(float64(avgSpeedInMs) / float64(1000000))
 	recordPerSecond := float64(1) / float64(avgSpeedInSecond) * float64(totalRecord)
 	log.Println("Concurrent Insert Order Speed:", avgSpeedInMs, "microsecond | ", int64(recordPerSecond), "records/s")
+
+	timeElapsed := time.Since(startTime)
+	log.Println("Total Time Insert Order Speed:", timeElapsed.Milliseconds(), "ms")
+}
+
+func concurrentUpdateOrders(ctx context.Context, db *pgxpool.Pool) {
+	orderQueries := generateUpdateOrderQueries()
+
+	startTime := time.Now()
+
+	workerPool := pkg.NewWorkerPool(numOfWorkers)
+	workerPool.Run()
+
+	totalTask := len(orderQueries)
+	resultC := make(chan result, totalTask)
+
+	for i := 0; i < totalTask; i++ {
+		query := orderQueries[i]
+		id := i
+		workerPool.AddTask(func() {
+			// log.Printf("[main] Starting task %d", id)
+
+			startTime := time.Now()
+
+			_, err := db.Exec(ctx, query)
+			if err != nil {
+				log.Fatalln(query, err)
+			}
+
+			timeElapsed := time.Since(startTime)
+
+			resultC <- result{
+				WorkerID:  id,
+				SpeedInMs: timeElapsed.Microseconds(),
+			}
+		})
+	}
+
+	var totalSpeedInMs int64
+	for i := 0; i < totalTask; i++ {
+		result := <-resultC
+		totalSpeedInMs += result.SpeedInMs
+		// log.Printf("[FNISH] Task %d", result)
+	}
+
+	avgSpeedInMs := float64(float64(totalSpeedInMs) / float64(totalTask))
+	totalRecord := numOfUserIDs * numOfOrders * numOfTrades
+	avgSpeedInSecond := float64(float64(avgSpeedInMs) / float64(1000000))
+	recordPerSecond := float64(1) / float64(avgSpeedInSecond) * float64(totalRecord)
+	log.Println("Concurrent Update Order Speed:", avgSpeedInMs, "microsecond | ", int64(recordPerSecond), "records/s")
+
+	timeElapsed := time.Since(startTime)
+	log.Println("Total Time Update Order Speed:", timeElapsed.Milliseconds(), "ms")
 }
 
 func concurrentInsertTrades(ctx context.Context, db *pgxpool.Pool) {
 	tradeQueries := generateInsertTradeQueries()
+
+	startTime := time.Now()
 
 	insertWorkerPool := pkg.NewWorkerPool(numOfWorkers)
 	insertWorkerPool.Run()
@@ -245,4 +314,93 @@ func concurrentInsertTrades(ctx context.Context, db *pgxpool.Pool) {
 	avgSpeedInSecond := float64(float64(avgSpeedInMs) / float64(1000000))
 	recordPerSecond := float64(1) / float64(avgSpeedInSecond) * float64(totalRecord)
 	log.Println("Concurrent Insert Trade Speed:", avgSpeedInMs, "microsecond | ", int64(recordPerSecond), "records/s")
+
+	timeElapsed := time.Since(startTime)
+	log.Println("Total Time Insert Trade Speed:", timeElapsed.Milliseconds(), "ms")
+}
+
+// https://github.com/jackc/pgx/issues/374
+func batchInsertOrder(ctx context.Context, db *pgxpool.Pool) {
+	startTime := time.Now()
+
+	orderQueries := generateInsertOrderQueries()
+
+	// orderQueriesChunks := chunkSlice(orderQueries, 5000)
+
+	// for _, orderQueriesChunk := range orderQueriesChunks {
+	batch := &pgx.Batch{}
+	// load insert statements into batch queue
+	for i := range orderQueries {
+		batch.Queue(orderQueries[i])
+	}
+	batch.Queue("select count(*) from orders")
+
+	// send batch to connection pool
+	br := db.SendBatch(ctx, batch)
+	defer br.Close()
+	// execute statements in batch queue
+	_, err := br.Exec()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Unable to execute statement in batch queue %v\n", err)
+		os.Exit(1)
+	}
+
+	// //Compare length of results slice to size of table
+	// fmt.Printf("size of results: %d\n", len(orderQueries))
+	// //check size of table for number of rows inserted
+	// // result of last SELECT statement
+	// var rowsInserted int
+	// br.QueryRow().Scan(&rowsInserted)
+	// fmt.Printf("size of table: %d\n", rowsInserted)
+	// }
+
+	timeElapsed := time.Since(startTime)
+	log.Println("Total Time Batch Insert Order Speed:", timeElapsed.Milliseconds(), "ms")
+}
+
+// https://github.com/jackc/pgx/issues/374
+func batchUpdateOrder(ctx context.Context, db *pgxpool.Pool) {
+	startTime := time.Now()
+
+	orderQueries := generateUpdateOrderQueries()
+
+	// orderQueriesChunks := chunkSlice(orderQueries, 10000)
+
+	// for _, orderQueriesChunk := range orderQueriesChunks {
+	batch := &pgx.Batch{}
+	// load update statements into batch queue
+	for i := range orderQueries {
+		batch.Queue(orderQueries[i])
+	}
+	batch.Queue("select count(*) from orders")
+
+	// send batch to connection pool
+	br := db.SendBatch(ctx, batch)
+	defer br.Close()
+	// execute statements in batch queue
+	_, err := br.Exec()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Unable to execute statement in batch queue %v\n", err)
+		os.Exit(1)
+	}
+	// }
+
+	timeElapsed := time.Since(startTime)
+	log.Println("Total Time Batch Update Order Speed:", timeElapsed.Milliseconds(), "ms")
+}
+
+func chunkSlice(slice []string, chunkSize int) [][]string {
+	var chunkedSlice [][]string
+
+	for i := 0; i < len(slice); i += chunkSize {
+		end := i + chunkSize
+
+		if end > len(slice) {
+			end = len(slice)
+		}
+
+		chunkedSlice = append(chunkedSlice, slice[i:end])
+	}
+
+	return chunkedSlice
 }
