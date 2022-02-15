@@ -28,9 +28,9 @@ func (wp *workerPool) Run() {
 		log.Printf("[WorkerPool] Worker %d has been spawned", i)
 		go func(workerID int) {
 			for task := range wp.queuedTaskC {
-				log.Printf("[WorkerPool] Worker %d start processing task", workerID)
+				// log.Printf("[WorkerPool] Worker %d start processing task", workerID)
 				task()
-				log.Printf("[WorkerPool] Worker %d finish processing task", workerID)
+				// log.Printf("[WorkerPool] Worker %d finish processing task", workerID)
 			}
 		}(i)
 	}

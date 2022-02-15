@@ -6,18 +6,17 @@ import (
 	"log"
 	"os"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/polapolo/timescaledbbenchmark/pkg"
 )
 
-const numOfUserIDs = 100000 // scale
-const numOfOrders = 10      // matched per user
-const numOfTrades = 1       // matched per order
+const numOfUserIDs = 10 // number of users
+const numOfOrders = 10  // order matched per user
+const numOfTrades = 1   // trade matched per order
 
-const numOfInsertWorkers = 4
+const numOfWorkers = 4
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -31,48 +30,12 @@ func main() {
 	// refresh table
 	refreshSchema(ctx, db)
 
-	orderQueries := generateInsertOrderQueries()
+	startTime := time.Now()
+	concurrentInsertOrders(ctx, db)
+	concurrentInsertTrades(ctx, db)
+	endTime := time.Since(startTime)
 
-	insertWorkerPool := pkg.NewWorkerPool(numOfInsertWorkers)
-	insertWorkerPool.Run()
-
-	totalTask := len(orderQueries)
-	resultC := make(chan bool, totalTask)
-
-	for i := 0; i < totalTask; i++ {
-		query := orderQueries[i]
-		id := i
-		insertWorkerPool.AddTask(func() {
-			log.Printf("[main] Starting task %d", id)
-			insertWithChannel(ctx, db, query, i)
-			resultC <- true
-		})
-	}
-
-	for i := 0; i < totalTask; i++ {
-		result := <-resultC
-		log.Println("[FNISH] Task", result)
-	}
-
-	// wg := sync.WaitGroup{}
-
-	// // insert order concurrently
-	// orderQueries := generateInsertOrderQueries()
-	// wg.Add(numOfInsertWorkers)
-	// for i := 0; i < numOfInsertWorkers; i++ {
-	// 	go insert(ctx, wg, db, orderQueries[i], i)
-	// }
-	// wg.Wait()
-
-	// // insert trade concurrently
-	// tradeQueries := generateInsertTradeQueries()
-	// wg.Add(len(tradeQueries))
-	// for i := 0; i < len(tradeQueries); i++ {
-	// 	go insert(ctx, wg, db, tradeQueries[i], i)
-	// }
-	// wg.Wait()
-
-	log.Println("DONE")
+	log.Println("Total Time:", endTime.Milliseconds(), "ms")
 }
 
 func connectDB(ctx context.Context) *pgxpool.Pool {
@@ -174,7 +137,7 @@ func generateInsertTradeQueries() []string {
 	for i := 1; i <= numOfUserIDs; i++ {
 		// orders
 		for j := 1; j <= numOfOrders; j++ {
-			offset := numOfOrders * i
+			offset := numOfOrders * (i - 1)
 
 			// trades
 			for k := 1; k <= numOfTrades; k++ {
@@ -186,31 +149,62 @@ func generateInsertTradeQueries() []string {
 	return queries
 }
 
-func insert(ctx context.Context, wg sync.WaitGroup, db *pgxpool.Pool, query string, i int) {
-	defer wg.Done()
+func concurrentInsertOrders(ctx context.Context, db *pgxpool.Pool) {
+	orderQueries := generateInsertOrderQueries()
 
-	_, err := db.Exec(ctx, query)
-	if err != nil {
-		log.Fatalln(query, err)
+	insertWorkerPool := pkg.NewWorkerPool(numOfWorkers)
+	insertWorkerPool.Run()
+
+	totalTask := len(orderQueries)
+	resultC := make(chan int, totalTask)
+
+	for i := 0; i < totalTask; i++ {
+		query := orderQueries[i]
+		id := i
+		insertWorkerPool.AddTask(func() {
+			log.Printf("[main] Starting task %d", id)
+
+			_, err := db.Exec(ctx, query)
+			if err != nil {
+				log.Fatalln(query, err)
+			}
+
+			resultC <- id
+		})
 	}
 
-	// log.Println(i, query)
+	for i := 0; i < totalTask; i++ {
+		result := <-resultC
+		log.Printf("[FNISH] Task %d", result)
+	}
 }
 
-func insertWithChannel(ctx context.Context, db *pgxpool.Pool, query string, i int) {
-	_, err := db.Exec(ctx, query)
-	if err != nil {
-		log.Fatalln(query, err)
+func concurrentInsertTrades(ctx context.Context, db *pgxpool.Pool) {
+	tradeQueries := generateInsertTradeQueries()
+
+	insertWorkerPool := pkg.NewWorkerPool(numOfWorkers)
+	insertWorkerPool.Run()
+
+	totalTask := len(tradeQueries)
+	resultC := make(chan int, totalTask)
+
+	for i := 0; i < totalTask; i++ {
+		query := tradeQueries[i]
+		id := i
+		insertWorkerPool.AddTask(func() {
+			log.Printf("[main] Starting task %d", id)
+
+			_, err := db.Exec(ctx, query)
+			if err != nil {
+				log.Fatalln(query, err)
+			}
+
+			resultC <- id
+		})
 	}
 
-	// log.Println(i, query)
+	for i := 0; i < totalTask; i++ {
+		result := <-resultC
+		log.Printf("[FNISH] Task %d", result)
+	}
 }
-
-// func updateCPUTagID() {
-// 	queryCreateTable := `CREATE TABLE sensors (id SERIAL PRIMARY KEY, type VARCHAR(50), location VARCHAR(50));`
-// 	_, err = dbpool.Exec(ctx, queryCreateTable)
-// 	if err != nil {
-// 		fmt.Fprintf(os.Stderr, "Unable to create SENSORS table: %v\n", err)
-// 		os.Exit(1)
-// 	}
-// }
