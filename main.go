@@ -31,15 +31,22 @@ func main() {
 	db := connectDB(ctx)
 	defer db.Close()
 
+	// refresh schema
 	refreshSchema(ctx, db)
 
-	batchInsertOrder(ctx, db)
-	batchInsertTrade(ctx, db)
-	batchInsertInitialCash(ctx, db)
+	// copy
+	copyOrders(ctx, db)
+	copyTrades(ctx, db)
+
+	// batch pgx
+	// batchInsertOrder(ctx, db)
+	// batchInsertTrade(ctx, db)
+	// batchInsertInitialCash(ctx, db)
 
 	// batchUpdateOrder(ctx, db)
 
-	concurrentlyGetEndBalance(ctx, db)
+	// worker pool
+	// concurrentlyGetEndBalance(ctx, db)
 }
 
 func connectDB(ctx context.Context) *pgxpool.Pool {
@@ -69,6 +76,7 @@ func refreshSchema(ctx context.Context, db *pgxpool.Pool) {
 		log.Fatalln(err)
 	}
 
+	// orders relational
 	_, err = db.Exec(ctx, `CREATE TABLE IF NOT EXISTS orders (
 		id BIGSERIAL PRIMARY KEY,
 		user_id bigint,
@@ -82,7 +90,35 @@ func refreshSchema(ctx context.Context, db *pgxpool.Pool) {
 		log.Fatalln(err)
 	}
 
-	// _, err = db.Exec(ctx, `SELECT create_hypertable('orders', 'timestamp')`)
+	// // orders timeseries
+	// _, err = db.Exec(ctx, `CREATE TABLE IF NOT EXISTS order_histories (
+	// 	id bigint,
+	// 	user_id bigint,
+	// 	stock_code varchar(6),
+	// 	type VARCHAR(1),
+	// 	lot bigint,
+	// 	price int,
+	// 	status int,
+	// 	created_at TIMESTAMPZ
+	// )`)
+	// if err != nil {
+	// 	log.Fatalln(err)
+	// }
+	// _, err = db.Exec(ctx, `SELECT create_hypertable('order_histories', 'created_at')`)
+	// if err != nil {
+	// 	log.Fatalln(err)
+	// }
+	// _, err = db.Exec(ctx, `CREATE MATERIALIZED VIEW order_histories_daily
+	// WITH (timescaledb.continuous,timescaledb.create_group_indexes)
+	// AS
+	// 	SELECT
+	// 		order_id,
+	// 		last(user_id, created_at),
+	// 		time_bucket('1 day', created_at) as bucket,
+	// 	   	last(order_id, created_at)
+	// 	FROM orders
+	// 	GROUP BY order_id
+	// 	WITH DATA;`)
 	// if err != nil {
 	// 	log.Fatalln(err)
 	// }
@@ -499,6 +535,93 @@ func batchUpdateOrder(ctx context.Context, db *pgxpool.Pool) {
 
 	timeElapsed := time.Since(startTime)
 	log.Println("Total Time Batch Update Order Speed:", timeElapsed.Milliseconds(), "ms")
+}
+
+func copyOrders(ctx context.Context, db *pgxpool.Pool) {
+	startTime := time.Now()
+
+	cols := []string{"id", "user_id", "stock_code", "type", "lot", "price", "status"}
+	dataRows := make([][]interface{}, 0)
+
+	// users
+	for i := 1; i <= numOfUserIDs; i++ {
+		// orders
+		for j := 1; j <= numOfOrders; j++ {
+			orderType := "B"
+			if j%2 == 0 {
+				orderType = "S"
+			}
+
+			offset := numOfOrders * (i - 1)
+
+			row := []interface{}{
+				int64(j + offset), // id
+				int64(i),          // user_id
+				"BBCA",            // stock_code
+				orderType,         // type
+				int64(10),         // lot
+				int(1000),         // price
+				int(1),            // status
+			}
+			dataRows = append(dataRows, row)
+		}
+	}
+
+	rows := pgx.CopyFromRows(dataRows)
+	inserted, err := db.CopyFrom(ctx, pgx.Identifier{"orders"}, cols, rows)
+	if err != nil {
+		panic(err)
+	}
+
+	if inserted != int64(len(dataRows)) {
+		fmt.Fprintf(os.Stderr, "Failed to insert all the data! Expected: %d, Got: %d", len(dataRows), inserted)
+		os.Exit(1)
+	}
+
+	timeElapsed := time.Since(startTime)
+	log.Println("Total Time Copy Order Speed:", timeElapsed.Milliseconds(), "ms")
+}
+
+func copyTrades(ctx context.Context, db *pgxpool.Pool) {
+	startTime := time.Now()
+
+	cols := []string{"order_id", "lot", "lot_multiplier", "price", "total", "created_at"}
+	dataRows := make([][]interface{}, 0)
+
+	// users
+	for i := 1; i <= numOfUserIDs; i++ {
+		// orders
+		for j := 1; j <= numOfOrders; j++ {
+			offset := numOfOrders * (i - 1)
+
+			// trades
+			for k := 1; k <= numOfTrades; k++ {
+				row := []interface{}{
+					int64(j + offset), // order_id
+					int64(10),         // lot
+					int(100),          // lot_multiplier
+					int(1000),         // price
+					int64(1000000),    // total
+					time.Now(),        // created_at
+				}
+				dataRows = append(dataRows, row)
+			}
+		}
+	}
+
+	rows := pgx.CopyFromRows(dataRows)
+	inserted, err := db.CopyFrom(ctx, pgx.Identifier{"trades"}, cols, rows)
+	if err != nil {
+		panic(err)
+	}
+
+	if inserted != int64(len(dataRows)) {
+		fmt.Fprintf(os.Stderr, "Failed to insert all the data! Expected: %d, Got: %d", len(dataRows), inserted)
+		os.Exit(1)
+	}
+
+	timeElapsed := time.Since(startTime)
+	log.Println("Total Time Copy Trades Speed:", timeElapsed.Milliseconds(), "ms")
 }
 
 func chunkSlice(slice []string, chunkSize int) [][]string {
