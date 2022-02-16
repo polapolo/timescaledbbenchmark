@@ -37,6 +37,7 @@ func main() {
 	// copy
 	copyOrders(ctx, db)
 	copyTrades(ctx, db)
+	copyInitialCash(ctx, db)
 
 	// batch pgx
 	// batchInsertOrder(ctx, db)
@@ -622,6 +623,36 @@ func copyTrades(ctx context.Context, db *pgxpool.Pool) {
 
 	timeElapsed := time.Since(startTime)
 	log.Println("Total Time Copy Trades Speed:", timeElapsed.Milliseconds(), "ms")
+}
+
+func copyInitialCash(ctx context.Context, db *pgxpool.Pool) {
+	startTime := time.Now()
+
+	cols := []string{"user_id", "cash_on_hand"}
+	dataRows := make([][]interface{}, 0)
+
+	// users
+	for i := 1; i <= numOfUserIDs; i++ {
+		row := []interface{}{
+			int64(i),       // user_id
+			int64(1000000), // cash_on_hand
+		}
+		dataRows = append(dataRows, row)
+	}
+
+	rows := pgx.CopyFromRows(dataRows)
+	inserted, err := db.CopyFrom(ctx, pgx.Identifier{"initial_cash"}, cols, rows)
+	if err != nil {
+		panic(err)
+	}
+
+	if inserted != int64(len(dataRows)) {
+		fmt.Fprintf(os.Stderr, "Failed to insert all the data! Expected: %d, Got: %d", len(dataRows), inserted)
+		os.Exit(1)
+	}
+
+	timeElapsed := time.Since(startTime)
+	log.Println("Total Time Copy Initial Cash Speed:", timeElapsed.Milliseconds(), "ms")
 }
 
 func chunkSlice(slice []string, chunkSize int) [][]string {
